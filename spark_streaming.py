@@ -7,6 +7,7 @@ import os
 
 my_name = "lina"
 building_sensors = f"{my_name}_spark_streaming_in"
+spark_streaming_allerts = f"{my_name}_alerts"
 
 # Пакет, необхідний для читання Kafka зі Spark
 os.environ["PYSPARK_SUBMIT_ARGS"] = (
@@ -30,7 +31,6 @@ df = (
     )
     .option("subscribe", building_sensors)
     .option("startingOffsets", "earliest")
-    .option("maxOffsetsPerTrigger", "5")
     .load()
 )
 
@@ -75,6 +75,98 @@ displaying_df = (
     .awaitTermination()
 )
 
+# Групування даних за полем 'value' і підрахунок mean
+mean_df = (
+    clean_df.withWatermark("timestamp", "10 seconds")
+    .groupBy(window("timestamp", "1 minutes", "30 seconds"), "number_of_sensors")
+    .agg(avg("temperature").alias("t_avg"), avg("humidity").alias("h_avg"))
+)
+
+# Виведення даних на екран
+displaying_df = (
+    mean_df.writeStream.trigger(availableNow=True)
+    .outputMode("update")
+    .format("console")
+    .option("checkpointLocation", "./tmp/checkpoints-4")
+    .start()
+    .awaitTermination()
+)
+
+alerts_df = spark.read.load(
+    "alerts_conditions.csv", format="csv", inferSchema="true", header="true"
+)
+
+joined_df = mean_df.join(alerts_df)
+
+# Виведення даних на екран
+displaying_df = (
+    joined_df.writeStream.trigger(availableNow=True)
+    .outputMode("append")
+    .format("console")
+    .options(truncate=False)
+    .option("checkpointLocation", "./tmp/checkpoints-51")
+    .start()
+    .awaitTermination()
+)
+
+alerts_result_df = joined_df.filter(
+    (
+        (joined_df.temperature_min < joined_df.t_avg)
+        & (joined_df.t_avg < joined_df.temperature_max)
+    )
+    | (
+        (joined_df.humidity_min < joined_df.h_avg)
+        & (joined_df.h_avg < joined_df.humidity_max)
+    )
+).drop("temperature_min", "temperature_max", "humidity_min", "humidity_max", "id")
+
+# Виведення даних на екран
+displaying_df = (
+    alerts_result_df.writeStream.trigger(availableNow=True)
+    .outputMode("append")
+    .format("console")
+    .options(truncate=False)
+    .option("checkpointLocation", "./tmp/checkpoints-5")
+    .start()
+    .awaitTermination()
+)
+
+# Підготовка даних для запису в Kafka
+alerts_result_df = alerts_result_df.withColumn("key", expr("uuid()"))
+prepare_to_kafka_df = alerts_result_df.select(
+    col("key"),
+    to_json(
+        struct(col("window"), col("t_avg"), col("h_avg"), col("code"), col("message"))
+    ).alias("value"),
+)
+
+# Виведення даних на екран
+displaying_df = (
+    prepare_to_kafka_df.writeStream.trigger(availableNow=True)
+    .outputMode("append")
+    .format("console")
+    .options(truncate=False)
+    .option("checkpointLocation", "./tmp/checkpoints-6")
+    .start()
+    .awaitTermination()
+)
+
+#
+query = (
+    prepare_to_kafka_df.writeStream.trigger(processingTime="30 seconds")
+    .format("kafka")
+    .option("kafka.bootstrap.servers", "77.81.230.104:9092")
+    .option("topic", spark_streaming_allerts)
+    .option("kafka.security.protocol", "SASL_PLAINTEXT")
+    .option("kafka.sasl.mechanism", "PLAIN")
+    .option(
+        "kafka.sasl.jaas.config",
+        "org.apache.kafka.common.security.plain.PlainLoginModule required username='admin' password='VawEzo1ikLtrA8Ug8THa';",
+    )
+    .option("checkpointLocation", "./tmp/checkpoints-7")
+    .start()
+    .awaitTermination()
+)
 # # Підготовка даних для запису в Kafka: формування ключ-значення
 # prepare_to_kafka_df = clean_df.select(
 #     col("key"), to_json(struct(col("value"), col("new_value"))).alias("value")
